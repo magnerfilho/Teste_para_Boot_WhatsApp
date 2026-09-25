@@ -1,86 +1,98 @@
-export default async function handler(req, res) {
-  // 1. VALIDAÇÃO DO WEBHOOK (Requisição GET da Meta)
-  if (req.method === 'GET') {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
+import { getConfig } from '../lib/config.js';
+import { handleIncomingMessage } from '../lib/bot.js';
 
-    const MY_VERIFY_TOKEN = 'meu_token_secreto_123';
+const recentMessageIds = new Set();
+const MAX_RECENT_MESSAGES = 200;
 
-    if (mode === 'subscribe' && token === MY_VERIFY_TOKEN) {
-      console.log('Webhook validado com sucesso!');
-      return res.status(200).send(challenge);
-    } else {
-      return res.status(403).json({ error: 'Token de verificação inválido.' });
+function rememberMessageId(messageId) {
+    if (!messageId) {
+        return false;
     }
-  }
 
-  // 2. RECEBIMENTO E RESPOSTA AUTOMÁTICA (Requisição POST da Meta)
-  if (req.method === 'POST') {
-    const body = req.body;
-
-    try {
-      // Verifica se o evento contém mensagens
-      const entry = body.entry?.[0];
-      const changes = entry?.changes?.[0];
-      const value = changes?.value;
-      const message = value?.messages?.[0];
-
-      // Se existir uma mensagem recebida (ignora notificações de leitura/entrega)
-      if (message) {
-        const from = message.from; // Número do usuário que mandou a mensagem
-        const textReceived = message.text?.body || ''; // Texto enviado pelo usuário
-
-        console.log(`Mensagem recebida de ${from}: "${textReceived}"`);
-
-        // Mensagem que o bot vai enviar de volta
-        const replyText = `Olá! Recebi sua mensagem: "${textReceived}". Este é um teste do meu bot!`;
-
-        // Envia a resposta de volta usando a Graph API da Meta
-        await sendWhatsAppMessage(from, replyText);
-      }
-
-      return res.status(200).send('EVENT_RECEIVED');
-    } catch (error) {
-      console.error('Erro ao processar mensagem do Webhook:', error);
-      return res.status(500).json({ error: 'Erro interno no servidor' });
+    if (recentMessageIds.has(messageId)) {
+        return true;
     }
-  }
 
-  return res.status(405).json({ error: 'Método não permitido.' });
+    recentMessageIds.add(messageId);
+
+    if (recentMessageIds.size > MAX_RECENT_MESSAGES) {
+        const firstId = recentMessageIds.values().next().value;
+        recentMessageIds.delete(firstId);
+    }
+
+    return false;
 }
 
-// Função auxiliar para enviar a mensagem através da API da Meta
-async function sendWhatsAppMessage(to, text) {
-  // ID do número de telefone de teste (ou do seu número em produção)
-  const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || '1272235799314854';
-  
-  // Token de acesso gerado no painel do Meta for Developers
-  const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
+function extractIncomingMessages(body) {
+    const entries = Array.isArray(body?.entry) ? body.entry : [];
+    const messages = [];
 
-  if (!ACCESS_TOKEN) {
-    console.error('ERRO: O Token de acesso do WhatsApp (WHATSAPP_ACCESS_TOKEN) não foi configurado!');
-    return;
-  }
+    for (const entry of entries) {
+        const changes = Array.isArray(entry?.changes) ? entry.changes : [];
 
-  const url = `https://graph.facebook.com/v26.0/${PHONE_NUMBER_ID}/messages`;
+        for (const change of changes) {
+            const value = change?.value;
+            const incoming = Array.isArray(value?.messages) ? value.messages : [];
 
-  const payload = {
-    messaging_product: 'whatsapp',
-    to: to,
-    type: 'text',
-    text: { body: text }
-  };
+            for (const message of incoming) {
+                messages.push(message);
+            }
+        }
+    }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${ACCESS_TOKEN}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
+    return messages;
+}
 
-  const data = await response.json();
-  console.log('Resposta do envio da Meta:', data);
+export default async function handler(req, res) {
+    const config = getConfig();
+
+    if (req.method === 'GET') {
+        const mode = req.query['hub.mode'];
+        const token = req.query['hub.verify_token'];
+        const challenge = req.query['hub.challenge'];
+
+        if (!mode && !token && !challenge) {
+            return res.status(200).send('Webhook do bot WhatsApp no ar.');
+        }
+
+        if (mode === 'subscribe' && token === config.verifyToken) {
+            console.log('Webhook validado com sucesso pela Meta.');
+            return res.status(200).send(challenge);
+        }
+
+        console.warn('Falha na validação do webhook.', { mode, tokenReceived: Boolean(token) });
+        return res.status(403).json({ error: 'Token de verificação inválido.' });
+    }
+
+    if (req.method === 'POST') {
+        const body = req.body || {};
+
+        console.log('POST recebido no webhook:', JSON.stringify(body));
+
+        try {
+            const messages = extractIncomingMessages(body);
+
+            if (messages.length === 0) {
+                console.log('POST sem mensagem de usuário (provavelmente status de entrega/leitura).');
+                return res.status(200).send('EVENT_RECEIVED');
+            }
+
+            for (const message of messages) {
+                if (rememberMessageId(message.id)) {
+                    console.log(`Mensagem duplicada ignorada: ${message.id}`);
+                    continue;
+                }
+
+                console.log(`Mensagem recebida de ${message.from}: tipo=${message.type} id=${message.id}`);
+                await handleIncomingMessage(message);
+            }
+
+            return res.status(200).send('EVENT_RECEIVED');
+        } catch (error) {
+            console.error('Erro ao processar webhook:', error);
+            return res.status(200).send('EVENT_RECEIVED');
+        }
+    }
+
+    return res.status(405).json({ error: 'Método não permitido.' });
 }

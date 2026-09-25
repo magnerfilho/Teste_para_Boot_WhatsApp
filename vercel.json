@@ -1,1 +1,8 @@
-{}
+{
+    "rewrites": [
+        {
+            "source": "/privacy",
+            "destination": "/api/privacy"
+        }
+    ]
+}
